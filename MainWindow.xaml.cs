@@ -354,6 +354,542 @@ namespace AndroidRecoveryTool
         private void DgFiles_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             btnRecoverSelected.IsEnabled = dgFiles.SelectedItems.Count > 0;
+            
+            // Update preview when selection changes
+            if (dgFiles.SelectedItem is RecoverableFile selectedFile)
+            {
+                _ = UpdatePreviewAsync(selectedFile);
+            }
+            else
+            {
+                ClearPreview();
+            }
+        }
+        
+        private async Task UpdatePreviewAsync(RecoverableFile file)
+        {
+            try
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    txtNoPreview.Visibility = Visibility.Collapsed;
+                    txtPreviewLoadingStatus.Text = "Loading preview...";
+                    
+                    // Update file info first
+                    txtPreviewFileName.Text = file.FileName;
+                    txtPreviewType.Text = file.FileType;
+                    txtPreviewSize.Text = file.FileSize;
+                    txtPreviewPath.Text = file.Path;
+                    txtPreviewStatus.Text = file.RecoveryStatus;
+                    txtPreviewDevicePath.Text = file.DevicePath;
+                    
+                    // Hide all preview types first
+                    imgPreview.Visibility = Visibility.Collapsed;
+                    pnlTextPreview.Visibility = Visibility.Collapsed;
+                    pnlFileInfo.Visibility = Visibility.Visible;
+                });
+
+                // Show appropriate preview based on file type
+                var fileType = file.FileType.ToUpper();
+                
+                if (fileType == "JPG" || fileType == "JPEG" || fileType == "PNG" || fileType == "GIF" || fileType == "WEBP")
+                {
+                    await LoadImagePreviewAsync(file);
+                }
+                else if (fileType == "TXT" || fileType == "PDF" || fileType == "DOC" || fileType == "DOCX")
+                {
+                    await LoadTextPreviewAsync(file);
+                }
+                else if (fileType == "MP4" || fileType == "AVI" || fileType == "MKV" || fileType == "MOV")
+                {
+                    ShowVideoInfo(file);
+                }
+                else if (fileType == "MP3" || fileType == "WAV" || fileType == "M4A" || fileType == "AAC")
+                {
+                    ShowAudioInfo(file);
+                }
+                else
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        txtNoPreview.Text = "File preview not available for this file type";
+                        txtNoPreview.Visibility = Visibility.Visible;
+                        txtPreviewLoadingStatus.Text = "Preview not available";
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    txtNoPreview.Text = $"Preview error: {ex.Message}";
+                    txtNoPreview.Visibility = Visibility.Visible;
+                    txtPreviewLoadingStatus.Text = "Error";
+                });
+            }
+        }
+
+        private async Task LoadImagePreviewAsync(RecoverableFile file)
+        {
+            try
+            {
+                if (_selectedDeviceId == null)
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        txtNoPreview.Text = "No device selected";
+                        txtNoPreview.Visibility = Visibility.Visible;
+                    });
+                    return;
+                }
+
+                Dispatcher.Invoke(() =>
+                {
+                    txtPreviewLoadingStatus.Text = "Downloading image...";
+                });
+
+                // Try to pull the file temporarily to show preview
+                var tempDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryPreview");
+                Directory.CreateDirectory(tempDir);
+                var extension = file.FileType.ToLower();
+                if (extension == "jpeg") extension = "jpg";
+                var tempFilePath = Path.Combine(tempDir, $"preview_{Guid.NewGuid()}.{extension}");
+
+                try
+                {
+                    // First verify file exists on device
+                    var testCommand = $"\"{_adbService.GetAdbPath()}\" -s {_selectedDeviceId} shell test -f \"{file.DevicePath}\" && echo EXISTS";
+                    
+                    var testProcessInfo = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = "cmd.exe",
+                        Arguments = $"/c {testCommand}",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    };
+
+                    bool fileExists = false;
+                    using (var testProcess = System.Diagnostics.Process.Start(testProcessInfo))
+                    {
+                        if (testProcess != null)
+                        {
+                            var testOutput = await testProcess.StandardOutput.ReadToEndAsync();
+                            await testProcess.WaitForExitAsync();
+                            fileExists = testOutput.Contains("EXISTS");
+                        }
+                    }
+
+                    if (!fileExists)
+                    {
+                        // File doesn't exist - attempt to recover it temporarily for preview
+                        Dispatcher.Invoke(() =>
+                        {
+                            txtPreviewLoadingStatus.Text = "Recovering file for preview...";
+                            txtNoPreview.Text = "Recovering deleted file temporarily for preview...\n\nThis may take a moment.";
+                            txtNoPreview.Visibility = Visibility.Visible;
+                        });
+                        
+                        // Try to recover file temporarily to preview location
+                        var tempRecoveryDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryPreview");
+                        Directory.CreateDirectory(tempRecoveryDir);
+                        
+                        // Create a copy of the file object to avoid modifying the original
+                        var fileCopy = new RecoverableFile
+                        {
+                            DevicePath = file.DevicePath,
+                            FileName = file.FileName,
+                            FileType = file.FileType,
+                            SizeInBytes = file.SizeInBytes,
+                            RecoveryStatus = file.RecoveryStatus
+                        };
+                        
+                        var recoverySuccess = await _recoveryService.RecoverFileAsync(
+                            _selectedDeviceId!,
+                            fileCopy,
+                            tempRecoveryDir
+                        );
+                        
+                        // Check if file was recovered - it will have updated DevicePath to local path
+                        if (recoverySuccess && !string.IsNullOrEmpty(fileCopy.DevicePath) && File.Exists(fileCopy.DevicePath))
+                        {
+                            // Update tempFilePath to use recovered file
+                            tempFilePath = fileCopy.DevicePath;
+                            fileExists = true;
+                            
+                            Dispatcher.Invoke(() =>
+                            {
+                                txtPreviewLoadingStatus.Text = "File recovered - loading preview...";
+                            });
+                        }
+                        else
+                        {
+                            // Recovery failed - show error
+                            Dispatcher.Invoke(() =>
+                            {
+                                txtNoPreview.Text = $"⚠️ Cannot preview this deleted file.\n\nThe file cannot be temporarily recovered for preview.\n\nPossible reasons:\n• File is permanently overwritten\n• Requires root access for deep recovery\n• File is corrupted\n\nTry recovering it permanently to see if it's still intact.";
+                                txtNoPreview.Visibility = Visibility.Visible;
+                                txtPreviewLoadingStatus.Text = "Preview unavailable";
+                                pnlFileInfo.Visibility = Visibility.Visible;
+                            });
+                            return;
+                        }
+                    }
+
+                    // Use ADB pull only if file wasn't already recovered for preview
+                    if (!fileExists || !File.Exists(tempFilePath))
+                    {
+                        var processInfo = new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = _adbService.GetAdbPath(),
+                            Arguments = $"-s {_selectedDeviceId} pull \"{file.DevicePath}\" \"{tempFilePath}\"",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true,
+                            WorkingDirectory = Path.GetDirectoryName(_adbService.GetAdbPath())
+                        };
+
+                        using var process = System.Diagnostics.Process.Start(processInfo);
+                        if (process != null)
+                        {
+                            var output = await process.StandardOutput.ReadToEndAsync();
+                            var error = await process.StandardError.ReadToEndAsync();
+                            await process.WaitForExitAsync();
+                            
+                            // Wait a bit for file to be written
+                            await Task.Delay(500);
+                        }
+                    }
+                    
+                    // Load preview if file exists (either from recovery or pull)
+                    if (File.Exists(tempFilePath) && new FileInfo(tempFilePath).Length > 0)
+                    {
+                            Dispatcher.Invoke(() =>
+                            {
+                                try
+                                {
+                                    var bitmap = new System.Windows.Media.Imaging.BitmapImage();
+                                    bitmap.BeginInit();
+                                    bitmap.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+                                    bitmap.UriSource = new Uri(tempFilePath, UriKind.Absolute);
+                                    bitmap.EndInit();
+                                    bitmap.Freeze();
+                                    
+                                    imgPreview.Source = bitmap;
+                                    imgPreview.Visibility = Visibility.Visible;
+                                    txtNoPreview.Visibility = Visibility.Collapsed;
+                                    txtPreviewLoadingStatus.Text = "Preview ready";
+                                    pnlFileInfo.Visibility = Visibility.Visible;
+                                }
+                                catch (Exception ex)
+                                {
+                                    txtNoPreview.Text = $"Could not load image: {ex.Message}";
+                                    txtNoPreview.Visibility = Visibility.Visible;
+                                    txtPreviewLoadingStatus.Text = "Error loading preview";
+                                    imgPreview.Visibility = Visibility.Collapsed;
+                                }
+                            });
+                        }
+                        else
+                        {
+                            // File doesn't exist or is inaccessible - this is expected for deleted files
+                            Dispatcher.Invoke(() =>
+                            {
+                                var statusMsg = file.RecoveryStatus.Contains("Deleted") || file.RecoveryStatus.Contains("Permanently") 
+                                    ? "This is a DELETED file. Preview is not available until the file is recovered.\n\nClick 'Recover Selected' to restore the file, then you can open it from your computer."
+                                    : $"File not accessible.\nPath: {file.DevicePath}\n\nThis file may need to be recovered first.";
+                                
+                                txtNoPreview.Text = $"⚠️ Cannot Preview Deleted File\n\n{statusMsg}";
+                                txtNoPreview.Visibility = Visibility.Visible;
+                                txtPreviewLoadingStatus.Text = "Deleted - Recover First";
+                                pnlFileInfo.Visibility = Visibility.Visible;
+                            });
+                        }
+                }
+                finally
+                {
+                    // Cleanup temp file after a delay (user might still be viewing)
+                    _ = Task.Delay(60000).ContinueWith(_ =>
+                    {
+                        try
+                        {
+                            if (File.Exists(tempFilePath))
+                                File.Delete(tempFilePath);
+                        }
+                        catch { }
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    txtNoPreview.Text = $"Preview error: {ex.Message}";
+                    txtNoPreview.Visibility = Visibility.Visible;
+                    imgPreview.Visibility = Visibility.Collapsed;
+                });
+            }
+        }
+
+        private async Task LoadTextPreviewAsync(RecoverableFile file)
+        {
+            try
+            {
+                if (_selectedDeviceId == null)
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        txtNoPreview.Text = "No device selected";
+                        txtNoPreview.Visibility = Visibility.Visible;
+                    });
+                    return;
+                }
+
+                if (file.SizeInBytes > 1024 * 1024) // Don't preview files larger than 1MB
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        txtNoPreview.Text = "File too large for preview (max 1MB)";
+                        txtNoPreview.Visibility = Visibility.Visible;
+                    });
+                    return;
+                }
+
+                Dispatcher.Invoke(() =>
+                {
+                    txtPreviewLoadingStatus.Text = "Downloading file...";
+                });
+
+                // Pull file temporarily for preview
+                var tempDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryPreview");
+                Directory.CreateDirectory(tempDir);
+                var tempFilePath = Path.Combine(tempDir, $"preview_{Guid.NewGuid()}.txt");
+
+                try
+                {
+                    // First verify file exists
+                    var testCommand = $"\"{_adbService.GetAdbPath()}\" -s {_selectedDeviceId} shell test -f \"{file.DevicePath}\" && echo EXISTS";
+                    
+                    var testProcessInfo = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = "cmd.exe",
+                        Arguments = $"/c {testCommand}",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    };
+
+                    bool fileExists = false;
+                    using (var testProcess = System.Diagnostics.Process.Start(testProcessInfo))
+                    {
+                        if (testProcess != null)
+                        {
+                            var testOutput = await testProcess.StandardOutput.ReadToEndAsync();
+                            await testProcess.WaitForExitAsync();
+                            fileExists = testOutput.Contains("EXISTS");
+                        }
+                    }
+
+                    if (!fileExists)
+                    {
+                        // File doesn't exist - attempt to recover it temporarily for preview
+                        Dispatcher.Invoke(() =>
+                        {
+                            txtPreviewLoadingStatus.Text = "Recovering file for preview...";
+                            txtNoPreview.Text = "Recovering deleted file temporarily for preview...\n\nThis may take a moment.";
+                            txtNoPreview.Visibility = Visibility.Visible;
+                        });
+                        
+                        // Try to recover file temporarily to preview location
+                        var tempRecoveryDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryPreview");
+                        Directory.CreateDirectory(tempRecoveryDir);
+                        
+                        // Create a copy of the file object to avoid modifying the original
+                        var fileCopy = new RecoverableFile
+                        {
+                            DevicePath = file.DevicePath,
+                            FileName = file.FileName,
+                            FileType = file.FileType,
+                            SizeInBytes = file.SizeInBytes,
+                            RecoveryStatus = file.RecoveryStatus
+                        };
+                        
+                        var recoverySuccess = await _recoveryService.RecoverFileAsync(
+                            _selectedDeviceId!,
+                            fileCopy,
+                            tempRecoveryDir
+                        );
+                        
+                        // Check if file was recovered - it will have updated DevicePath to local path
+                        if (recoverySuccess && !string.IsNullOrEmpty(fileCopy.DevicePath) && File.Exists(fileCopy.DevicePath))
+                        {
+                            // Update tempFilePath to use recovered file
+                            tempFilePath = fileCopy.DevicePath;
+                            fileExists = true;
+                            
+                            Dispatcher.Invoke(() =>
+                            {
+                                txtPreviewLoadingStatus.Text = "File recovered - loading preview...";
+                            });
+                        }
+                        else
+                        {
+                            // Recovery failed - show error
+                            Dispatcher.Invoke(() =>
+                            {
+                                txtNoPreview.Text = $"⚠️ Cannot preview this deleted file.\n\nThe file cannot be temporarily recovered for preview.\n\nPossible reasons:\n• File is permanently overwritten\n• Requires root access for deep recovery\n• File is corrupted\n\nTry recovering it permanently to see if it's still intact.";
+                                txtNoPreview.Visibility = Visibility.Visible;
+                                txtPreviewLoadingStatus.Text = "Preview unavailable";
+                            });
+                            return;
+                        }
+                    }
+
+                    // Use ADB pull only if file wasn't already recovered for preview
+                    if (!fileExists || !File.Exists(tempFilePath))
+                    {
+                        var processInfo = new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = _adbService.GetAdbPath(),
+                            Arguments = $"-s {_selectedDeviceId} pull \"{file.DevicePath}\" \"{tempFilePath}\"",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true,
+                            WorkingDirectory = Path.GetDirectoryName(_adbService.GetAdbPath())
+                        };
+
+                        using var process = System.Diagnostics.Process.Start(processInfo);
+                        if (process != null)
+                        {
+                            var output = await process.StandardOutput.ReadToEndAsync();
+                            var error = await process.StandardError.ReadToEndAsync();
+                            await process.WaitForExitAsync();
+                            
+                            // Wait for file to be written
+                            await Task.Delay(1000);
+                        }
+                    }
+                    
+                    // Load preview if file exists (either from recovery or pull)
+                    if (File.Exists(tempFilePath) && new FileInfo(tempFilePath).Length > 0)
+                    {
+                            var text = await File.ReadAllTextAsync(tempFilePath);
+                            // Limit preview to first 2000 characters
+                            var previewText = text.Length > 2000 ? text.Substring(0, 2000) + "\n\n... (truncated - file is longer)" : text;
+                            
+                            Dispatcher.Invoke(() =>
+                            {
+                                txtPreview.Text = previewText;
+                                pnlTextPreview.Visibility = Visibility.Visible;
+                                txtNoPreview.Visibility = Visibility.Collapsed;
+                                txtPreviewLoadingStatus.Text = "Preview ready";
+                                pnlFileInfo.Visibility = Visibility.Visible;
+                            });
+                        }
+                        else
+                        {
+                            // Try alternative method using shell cat
+                            try
+                            {
+                                var catOutput = await _adbService.ExecuteShellCommandAsync(_selectedDeviceId, $"cat \"{file.DevicePath}\"");
+                                if (!string.IsNullOrWhiteSpace(catOutput) && catOutput.Length > 0)
+                                {
+                                    await File.WriteAllTextAsync(tempFilePath, catOutput);
+                                    var previewText = catOutput.Length > 2000 ? catOutput.Substring(0, 2000) + "\n\n... (truncated)" : catOutput;
+                                    
+                                    Dispatcher.Invoke(() =>
+                                    {
+                                        txtPreview.Text = previewText;
+                                        pnlTextPreview.Visibility = Visibility.Visible;
+                                        txtNoPreview.Visibility = Visibility.Collapsed;
+                                        txtPreviewLoadingStatus.Text = "Preview ready";
+                                        pnlFileInfo.Visibility = Visibility.Visible;
+                                    });
+                                    return;
+                                }
+                            }
+                            catch { }
+
+                            Dispatcher.Invoke(() =>
+                            {
+                                var statusMsg = file.RecoveryStatus.Contains("Deleted") || file.RecoveryStatus.Contains("Permanently")
+                                    ? "⚠️ This is a DELETED file.\n\nPreview is not available for deleted files.\n\nTo view this file:\n1. Click 'Recover Selected' to restore it\n2. After recovery, open it from your computer"
+                                    : $"File not accessible.\nPath: {file.DevicePath}\n\nThis file may need to be recovered first.";
+                                
+                                txtNoPreview.Text = statusMsg;
+                                txtNoPreview.Visibility = Visibility.Visible;
+                                txtPreviewLoadingStatus.Text = "Deleted - Recover First";
+                                pnlFileInfo.Visibility = Visibility.Visible;
+                            });
+                        }
+                }
+                finally
+                {
+                    _ = Task.Delay(60000).ContinueWith(_ =>
+                    {
+                        try
+                        {
+                            if (File.Exists(tempFilePath))
+                                File.Delete(tempFilePath);
+                        }
+                        catch { }
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    txtNoPreview.Text = $"Preview error: {ex.Message}";
+                    txtNoPreview.Visibility = Visibility.Visible;
+                    pnlTextPreview.Visibility = Visibility.Collapsed;
+                });
+            }
+        }
+
+        private void ShowVideoInfo(RecoverableFile file)
+        {
+                Dispatcher.Invoke(() =>
+                {
+                    txtPreview.Text = $"Video File Information\n\nFile: {file.FileName}\nType: {file.FileType}\nSize: {file.FileSize}\nStatus: {file.RecoveryStatus}\n\nTo view the video, recover the file first.";
+                    pnlTextPreview.Visibility = Visibility.Visible;
+                    txtNoPreview.Visibility = Visibility.Collapsed;
+                    txtPreviewLoadingStatus.Text = "Info only";
+                    pnlFileInfo.Visibility = Visibility.Visible;
+                });
+        }
+
+        private void ShowAudioInfo(RecoverableFile file)
+        {
+                Dispatcher.Invoke(() =>
+                {
+                    txtPreview.Text = $"Audio File Information\n\nFile: {file.FileName}\nType: {file.FileType}\nSize: {file.FileSize}\nStatus: {file.RecoveryStatus}\n\nTo play the audio, recover the file first.";
+                    pnlTextPreview.Visibility = Visibility.Visible;
+                    txtNoPreview.Visibility = Visibility.Collapsed;
+                    txtPreviewLoadingStatus.Text = "Info only";
+                    pnlFileInfo.Visibility = Visibility.Visible;
+                });
+        }
+
+        private void ClearPreview()
+        {
+            txtNoPreview.Visibility = Visibility.Visible;
+            txtNoPreview.Text = "Select a file to preview";
+            txtPreviewLoadingStatus.Text = "";
+            imgPreview.Visibility = Visibility.Collapsed;
+            pnlTextPreview.Visibility = Visibility.Collapsed;
+            imgPreview.Source = null;
+            txtPreview.Text = "";
+            txtPreviewFileName.Text = "";
+            txtPreviewType.Text = "";
+            txtPreviewSize.Text = "";
+            txtPreviewPath.Text = "";
+            txtPreviewStatus.Text = "";
+            txtPreviewDevicePath.Text = "";
         }
 
         private async void BtnRecoverSelected_Click(object sender, RoutedEventArgs e)
@@ -398,17 +934,50 @@ namespace AndroidRecoveryTool
             btnRecoverAll.IsEnabled = false;
 
             int recovered = 0;
+            int failed = 0;
             int total = files.Count;
 
             try
             {
+                txtStatus.Text = $"Starting recovery of {total} file(s)...";
+                
                 foreach (var file in files)
                 {
                     if (file.RecoveryStatus == "Recovered")
+                    {
+                        recovered++;
                         continue;
+                    }
 
-                    txtProgress.Text = $"Recovering {recovered + 1}/{total}...";
+                    Dispatcher.Invoke(() =>
+                    {
+                        txtProgress.Text = $"Recovering {recovered + failed + 1}/{total}... {file.FileName}";
+                        txtStatus.Text = $"Recovering: {file.FileName} ({recovered + failed + 1}/{total})";
+                    });
                     
+                    // Check if file still exists on device before attempting recovery
+                    try
+                    {
+                        var testResult = await _adbService.ExecuteShellCommandAsync(_selectedDeviceId!, $"test -f \"{file.DevicePath}\" && echo EXISTS");
+                        bool fileExists = testResult.Contains("EXISTS");
+                        
+                        if (!fileExists && (file.RecoveryStatus.Contains("Deleted") || file.RecoveryStatus.Contains("Permanently")))
+                        {
+                            Dispatcher.Invoke(() =>
+                            {
+                                file.RecoveryStatus = "Cannot Recover - File Permanently Deleted";
+                                var index = _recoverableFiles.IndexOf(file);
+                                if (index >= 0)
+                                {
+                                    _recoverableFiles[index] = file;
+                                }
+                            });
+                            failed++;
+                            continue;
+                        }
+                    }
+                    catch { }
+
                     var success = await _recoveryService.RecoverFileAsync(
                         _selectedDeviceId!,
                         file,
@@ -416,43 +985,89 @@ namespace AndroidRecoveryTool
                     );
 
                     if (success)
-                        recovered++;
-
-                    var index = _recoverableFiles.IndexOf(file);
-                    if (index >= 0)
                     {
-                        _recoverableFiles[index] = file;
+                        recovered++;
                     }
+                    else
+                    {
+                        failed++;
+                    }
+
+                    // Update UI with current file status
+                    Dispatcher.Invoke(() =>
+                    {
+                        var index = _recoverableFiles.IndexOf(file);
+                        if (index >= 0)
+                        {
+                            _recoverableFiles[index] = file;
+                        }
+                        
+                        // Refresh DataGrid
+                        dgFiles.Items.Refresh();
+                    });
                 }
 
-                txtStatus.Text = $"Recovery complete. {recovered} of {total} files recovered successfully.";
-                txtProgress.Text = "";
+                Dispatcher.Invoke(() =>
+                {
+                    txtStatus.Text = $"Recovery complete. {recovered} recovered, {failed} failed out of {total} files.";
+                    txtProgress.Text = "";
+                });
                 
                 if (recovered > 0)
                 {
                     var result = System.Windows.MessageBox.Show(
-                        $"{recovered} file(s) recovered successfully!\n\nOpen recovery folder?",
+                        $"Recovery Results:\n\n✓ Successfully recovered: {recovered} file(s)\n✗ Failed: {failed} file(s)\n\n" +
+                        $"Recovered files saved to:\n{_recoveryDestinationPath}\n\n" +
+                        $"Open recovery folder?",
                         "Recovery Complete",
                         MessageBoxButton.YesNo,
                         MessageBoxImage.Information);
 
                     if (result == MessageBoxResult.Yes)
                     {
-                        System.Diagnostics.Process.Start("explorer.exe", _recoveryDestinationPath);
+                        try
+                        {
+                            System.Diagnostics.Process.Start("explorer.exe", _recoveryDestinationPath);
+                        }
+                        catch
+                        {
+                            System.Windows.MessageBox.Show($"Files saved to: {_recoveryDestinationPath}", "Recovery Complete");
+                        }
                     }
+                }
+                else if (failed > 0)
+                {
+                    System.Windows.MessageBox.Show(
+                        $"Recovery Failed:\n\nCould not recover any files.\n\n" +
+                        $"Possible reasons:\n" +
+                        $"• Files are permanently deleted (overwritten)\n" +
+                        $"• Files require root access for recovery\n" +
+                        $"• Files are in inaccessible locations\n" +
+                        $"• Device disconnected or unauthorized\n\n" +
+                        $"Check file status in the list for details.",
+                        "Recovery Failed",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
                 }
             }
             catch (Exception ex)
             {
-                txtStatus.Text = $"Error during recovery: {ex.Message}";
+                Dispatcher.Invoke(() =>
+                {
+                    txtStatus.Text = $"Error during recovery: {ex.Message}";
+                    txtProgress.Text = "";
+                });
                 System.Windows.MessageBox.Show($"Recovery error: {ex.Message}", "Error", 
                     MessageBoxButton.OK, MessageBoxImage.Error);
             }
             finally
             {
-                btnRecoverSelected.IsEnabled = dgFiles.SelectedItems.Count > 0;
-                btnRecoverAll.IsEnabled = _recoverableFiles.Count > 0;
-                txtProgress.Text = "";
+                Dispatcher.Invoke(() =>
+                {
+                    btnRecoverSelected.IsEnabled = dgFiles.SelectedItems.Count > 0;
+                    btnRecoverAll.IsEnabled = _recoverableFiles.Count > 0;
+                    txtProgress.Text = "";
+                });
             }
         }
     }

@@ -29,21 +29,7 @@ x86/
 **/packages/*
 !**/packages/build/
 
-## ADB files (users need to download these)
+## ADB files (do not commit ADB binaries)
 adb/adb.exe
 adb/AdbWinApi.dll
 adb/AdbWinUsbApi.dll
-
-## Keep ADB setup files
-!adb/README.txt
-!adb/download-adb.ps1
-
-## IDE
-.idea/
-*.swp
-*.swo
-*~
-
-## OS
-.DS_Store
-Thumbs.db

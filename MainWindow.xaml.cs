@@ -31,6 +31,9 @@ namespace AndroidRecoveryTool
 
             lstDevices.ItemsSource = _devices;
             dgFiles.ItemsSource = _recoverableFiles;
+            
+            // Set DataContext for thumbnail binding
+            dgFiles.DataContext = _recoverableFiles;
 
             _recoveryService.FileFound += OnFileFound;
             _recoveryService.ProgressUpdate += OnProgressUpdate;
@@ -334,6 +337,83 @@ namespace AndroidRecoveryTool
                 _recoverableFiles.Add(file);
                 UpdateFileCount();
             });
+            
+            // Load thumbnail for the file asynchronously
+            _ = LoadThumbnailAsync(file);
+        }
+
+        private async Task LoadThumbnailAsync(RecoverableFile file)
+        {
+            try
+            {
+                if (_selectedDeviceId == null) return;
+
+                // Only load thumbnails for images and videos
+                var fileType = file.FileType.ToUpper();
+                bool isImage = fileType == "JPG" || fileType == "JPEG" || fileType == "PNG" || fileType == "GIF" || fileType == "WEBP";
+                bool isVideo = fileType == "MP4" || fileType == "AVI" || fileType == "MKV" || fileType == "MOV" || 
+                              fileType == "M4V" || fileType == "FLV" || fileType == "WMV" || fileType == "3GP";
+
+                if (!isImage && !isVideo) return;
+
+                // Create thumbnail directory
+                var thumbDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryThumbnails");
+                Directory.CreateDirectory(thumbDir);
+                
+                var thumbFileName = $"{Guid.NewGuid()}.{fileType.ToLower()}";
+                var thumbPath = Path.Combine(thumbDir, thumbFileName);
+
+                // Try to pull a small thumbnail from device (first few KB should be enough for preview)
+                if (isImage)
+                {
+                    // For images, try to pull the file (it will be scaled by the Image control)
+                    var testResult = await _adbService.ExecuteShellCommandAsync(_selectedDeviceId, $"test -f \"{file.DevicePath}\" && echo EXISTS");
+                    if (testResult.Contains("EXISTS"))
+                    {
+                        // Pull thumbnail from device
+                        var pullProcess = new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = _adbService.GetAdbPath(),
+                            Arguments = $"-s {_selectedDeviceId} pull \"{file.DevicePath}\" \"{thumbPath}\"",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true,
+                            WorkingDirectory = Path.GetDirectoryName(_adbService.GetAdbPath()) ?? ""
+                        };
+
+                        using var process = System.Diagnostics.Process.Start(pullProcess);
+                        if (process != null)
+                        {
+                            await process.WaitForExitAsync();
+                            await Task.Delay(500);
+                            
+                            if (File.Exists(thumbPath) && new FileInfo(thumbPath).Length > 0)
+                            {
+                                Dispatcher.Invoke(() =>
+                                {
+                                    file.ThumbnailPath = thumbPath;
+                                });
+                                return;
+                            }
+                        }
+                    }
+                }
+                else if (isVideo)
+                {
+                    // For videos, show a video icon or extract thumbnail frame
+                    // For now, just use a placeholder - could use ffmpeg later
+                    Dispatcher.Invoke(() =>
+                    {
+                        // Set a placeholder path or null - we'll handle this in the template
+                        file.ThumbnailPath = "";
+                    });
+                }
+            }
+            catch
+            {
+                // Silently fail - thumbnails are optional
+            }
         }
 
         private void OnProgressUpdate(object? sender, string message)
@@ -353,17 +433,39 @@ namespace AndroidRecoveryTool
 
         private void DgFiles_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            btnRecoverSelected.IsEnabled = dgFiles.SelectedItems.Count > 0;
-            
-            // Update preview when selection changes
-            if (dgFiles.SelectedItem is RecoverableFile selectedFile)
+            // Legacy handler - thumbnails use click events instead
+            UpdateRecoverButtonStates();
+        }
+
+        private void Thumbnail_MouseLeftButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
+        {
+            if (sender is Border border && border.Tag is RecoverableFile file)
             {
-                _ = UpdatePreviewAsync(selectedFile);
+                _ = UpdatePreviewAsync(file);
             }
-            else
-            {
-                ClearPreview();
-            }
+        }
+
+        private void Thumbnail_Checked(object sender, RoutedEventArgs e)
+        {
+            UpdateRecoverButtonStates();
+        }
+
+        private void Thumbnail_Unchecked(object sender, RoutedEventArgs e)
+        {
+            UpdateRecoverButtonStates();
+        }
+
+        private void Thumbnail_Checkbox_Click(object sender, RoutedEventArgs e)
+        {
+            // Prevent the click from bubbling to the border
+            e.Handled = true;
+            UpdateRecoverButtonStates();
+        }
+
+        private void UpdateRecoverButtonStates()
+        {
+            var selectedCount = _recoverableFiles.Count(f => f.IsSelected);
+            btnRecoverSelected.IsEnabled = selectedCount > 0;
         }
         
         private async Task UpdatePreviewAsync(RecoverableFile file)
@@ -1142,7 +1244,11 @@ namespace AndroidRecoveryTool
 
         private async void BtnRecoverSelected_Click(object sender, RoutedEventArgs e)
         {
-            if (_selectedDeviceId == null || dgFiles.SelectedItems.Count == 0)
+            if (_selectedDeviceId == null)
+                return;
+
+            var selectedFiles = _recoverableFiles.Where(f => f.IsSelected).ToList();
+            if (selectedFiles.Count == 0)
                 return;
 
             var folderDialog = new FolderBrowserDialog
@@ -1154,7 +1260,7 @@ namespace AndroidRecoveryTool
             if (folderDialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
             {
                 _recoveryDestinationPath = folderDialog.SelectedPath;
-                await RecoverFiles(dgFiles.SelectedItems.Cast<RecoverableFile>().ToList());
+                await RecoverFiles(selectedFiles);
             }
         }
 
@@ -1312,7 +1418,7 @@ namespace AndroidRecoveryTool
             {
                 Dispatcher.Invoke(() =>
                 {
-                    btnRecoverSelected.IsEnabled = dgFiles.SelectedItems.Count > 0;
+                    UpdateRecoverButtonStates();
                     btnRecoverAll.IsEnabled = _recoverableFiles.Count > 0;
                     txtProgress.Text = "";
                 });

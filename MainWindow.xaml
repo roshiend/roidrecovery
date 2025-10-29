@@ -1,6 +1,7 @@
 <Window x:Class="AndroidRecoveryTool.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:AndroidRecoveryTool"
         Title="Android File Recovery Tool" Height="700" Width="1200"
         Background="{StaticResource BackgroundBrush}"
         WindowStartupLocation="CenterScreen">
@@ -102,17 +103,107 @@
                                       Foreground="{StaticResource PrimaryBrush}"/>
                         </StackPanel>
 
-                        <DataGrid x:Name="dgFiles" Grid.Row="1" AutoGenerateColumns="False" 
-                                 CanUserAddRows="False" IsReadOnly="True" 
-                                 SelectionChanged="DgFiles_SelectionChanged"
-                                 BorderBrush="#E0E0E0" SelectionMode="Single">
-                            <DataGrid.Columns>
-                                <DataGridTextColumn Header="File Name" Binding="{Binding FileName}" Width="*"/>
-                                <DataGridTextColumn Header="Type" Binding="{Binding FileType}" Width="80"/>
-                                <DataGridTextColumn Header="Size" Binding="{Binding FileSize}" Width="80"/>
-                                <DataGridTextColumn Header="Status" Binding="{Binding RecoveryStatus}" Width="120"/>
-                            </DataGrid.Columns>
-                        </DataGrid>
+                        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                            <ItemsControl x:Name="dgFiles" BorderBrush="#E0E0E0">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <WrapPanel Orientation="Horizontal" />
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Width="180" Height="220" Margin="5" Padding="8" 
+                                               Background="White" BorderBrush="#E0E0E0" BorderThickness="1"
+                                               Cursor="Hand" MouseLeftButtonUp="Thumbnail_MouseLeftButtonUp"
+                                               Tag="{Binding}">
+                                            <Border.Effect>
+                                                <DropShadowEffect Color="Gray" Direction="315" ShadowDepth="2" Opacity="0.3" BlurRadius="5"/>
+                                            </Border.Effect>
+                                            <Grid>
+                                                <Grid.RowDefinitions>
+                                                    <RowDefinition Height="Auto"/>
+                                                    <RowDefinition Height="*"/>
+                                                    <RowDefinition Height="Auto"/>
+                                                    <RowDefinition Height="Auto"/>
+                                                </Grid.RowDefinitions>
+
+                                                <!-- Checkbox at top right -->
+                                                <CheckBox Grid.Row="0" HorizontalAlignment="Right" VerticalAlignment="Top"
+                                                         IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                                         Checked="Thumbnail_Checked" Unchecked="Thumbnail_Unchecked"
+                                                         Click="Thumbnail_Checkbox_Click"/>
+
+                                                <!-- Thumbnail Image/Icon -->
+                                                <Border Grid.Row="1" Width="160" Height="120" Margin="0,0,0,5"
+                                                       Background="#F5F5F5" BorderBrush="#E0E0E0" BorderThickness="1">
+                                                    <Grid>
+                                                        <!-- Image thumbnail for photos/videos -->
+                                                        <Image x:Name="imgThumbnail" Stretch="Uniform" 
+                                                              Source="{Binding ThumbnailPath}" 
+                                                              HorizontalAlignment="Center" VerticalAlignment="Center">
+                                                            <Image.Style>
+                                                                <Style TargetType="Image">
+                                                                    <Style.Triggers>
+                                                                        <DataTrigger Binding="{Binding ThumbnailPath}" Value="">
+                                                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding ThumbnailPath}" Value="{x:Null}">
+                                                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                                                        </DataTrigger>
+                                                                    </Style.Triggers>
+                                                                </Style>
+                                                            </Image.Style>
+                                                        </Image>
+                                                        
+                                                        <!-- Placeholder icon/text for documents/audio/other -->
+                                                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                                                            <StackPanel.Style>
+                                                                <Style TargetType="StackPanel">
+                                                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                                                    <Style.Triggers>
+                                                                        <DataTrigger Binding="{Binding ThumbnailPath}" Value="">
+                                                                            <Setter Property="Visibility" Value="Visible"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding ThumbnailPath}" Value="{x:Null}">
+                                                                            <Setter Property="Visibility" Value="Visible"/>
+                                                                        </DataTrigger>
+                                                                    </Style.Triggers>
+                                                                </Style>
+                                                            </StackPanel.Style>
+                                                            <TextBlock FontSize="36" HorizontalAlignment="Center" 
+                                                                      Foreground="#CCCCCC" FontWeight="Bold">
+                                                                <TextBlock.Text>
+                                                                    <Binding Path="FileType">
+                                                                        <Binding.Converter>
+                                                                            <local:FileTypeToIconConverter/>
+                                                                        </Binding.Converter>
+                                                                    </Binding>
+                                                                </TextBlock.Text>
+                                                            </TextBlock>
+                                                            <TextBlock Text="{Binding FileType}" FontSize="10" 
+                                                                      Foreground="#999999" HorizontalAlignment="Center" 
+                                                                      Margin="0,5,0,0"/>
+                                                        </StackPanel>
+                                                    </Grid>
+                                                </Border>
+
+                                                <!-- File Name -->
+                                                <TextBlock Grid.Row="2" Text="{Binding FileName}" 
+                                                          TextWrapping="Wrap" FontSize="11" FontWeight="SemiBold"
+                                                          MaxHeight="35" TextTrimming="CharacterEllipsis" Margin="0,0,0,3"/>
+
+                                                <!-- File Info -->
+                                                <StackPanel Grid.Row="3" Orientation="Vertical">
+                                                    <TextBlock Text="{Binding FileType}" FontSize="9" Foreground="Gray" Margin="0,0,0,2"/>
+                                                    <TextBlock Text="{Binding FileSize}" FontSize="9" Foreground="Gray" Margin="0,0,0,2"/>
+                                                    <TextBlock Text="{Binding RecoveryStatus}" FontSize="9" Foreground="Gray"/>
+                                                </StackPanel>
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
 
                         <Border Grid.Row="2" Background="#FFF3E0" Padding="10" Margin="0,15,0,0" 
                                BorderBrush="#FFB74D" BorderThickness="1">
@@ -155,6 +246,24 @@
                                 <Border Background="#F9F9F9" Padding="10" BorderBrush="#E0E0E0" BorderThickness="1" Margin="0,0,0,15">
                                     <Image x:Name="imgPreview" Stretch="Uniform" MaxHeight="500" MaxWidth="500" 
                                           Visibility="Collapsed" HorizontalAlignment="Center"/>
+                                </Border>
+                                
+                                <!-- Video Preview -->
+                                <Border x:Name="pnlVideoPreview" Background="#F9F9F9" Padding="10" BorderBrush="#E0E0E0" BorderThickness="1" 
+                                       Visibility="Collapsed" Margin="0,0,0,15">
+                                    <StackPanel>
+                                        <MediaElement x:Name="mediaVideoPreview" LoadedBehavior="Manual" UnloadedBehavior="Stop" 
+                                                     Stretch="Uniform" MaxHeight="400" MaxWidth="600" 
+                                                     HorizontalAlignment="Center" MediaEnded="MediaVideoPreview_MediaEnded"/>
+                                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,10,0,0">
+                                            <Button x:Name="btnPlayVideo" Content="▶ Play" Click="BtnPlayVideo_Click" Margin="0,0,5,0" 
+                                                   Padding="10,5" Background="{StaticResource AccentBrush}" Foreground="White"/>
+                                            <Button x:Name="btnPauseVideo" Content="⏸ Pause" Click="BtnPauseVideo_Click" Margin="0,0,5,0" 
+                                                   Padding="10,5" Background="{StaticResource PrimaryBrush}" Foreground="White"/>
+                                            <Button x:Name="btnStopVideo" Content="⏹ Stop" Click="BtnStopVideo_Click" Padding="10,5" 
+                                                   Background="#FF5722" Foreground="White"/>
+                                        </StackPanel>
+                                    </StackPanel>
                                 </Border>
                                 
                                 <!-- Text Preview -->

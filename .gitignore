@@ -1,0 +1,49 @@
+## .NET
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+*.user
+*.suo
+*.cache
+*.vshost.exe
+*.vshost.exe.config
+
+## Visual Studio
+.vs/
+.vscode/
+*.user
+*.suo
+
+## Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Bb]in/
+[Oo]bj/
+
+## NuGet
+*.nupkg
+**/packages/*
+!**/packages/build/
+
+## ADB files (users need to download these)
+adb/adb.exe
+adb/AdbWinApi.dll
+adb/AdbWinUsbApi.dll
+
+## Keep ADB setup files
+!adb/README.txt
+!adb/download-adb.ps1
+
+## IDE
+.idea/
+*.swp
+*.swo
+*~
+
+## OS
+.DS_Store
+Thumbs.db

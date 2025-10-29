@@ -1,0 +1,138 @@
+<Window x:Class="AndroidRecoveryTool.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Android File Recovery Tool" Height="700" Width="1200"
+        Background="{StaticResource BackgroundBrush}"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <Border Grid.Row="0" Background="{StaticResource PrimaryBrush}" Padding="20" Margin="0,0,0,20">
+            <StackPanel>
+                <TextBlock Text="Android Deleted Files Recovery" FontSize="24" FontWeight="Bold" Foreground="White"/>
+                <TextBlock Text="Recover deleted photos, videos, documents, and more from your Android device" 
+                          FontSize="12" Foreground="White" Opacity="0.9" Margin="0,5,0,0"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Main Content -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="300"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Device Panel -->
+            <Border Grid.Column="0" Background="{StaticResource CardBrush}" Padding="15" Margin="0,0,10,0" 
+                   BorderBrush="#E0E0E0" BorderThickness="1">
+                <StackPanel>
+                    <TextBlock Text="Connected Devices" FontSize="18" FontWeight="Bold" Margin="0,0,0,15"/>
+                    
+                    <Button x:Name="btnRefreshDevices" Content="🔄 Refresh Devices" Click="BtnRefreshDevices_Click" 
+                           Margin="0,0,0,10" Background="{StaticResource AccentBrush}" Foreground="White"/>
+                    
+                    <Button x:Name="btnRestartAdb" Content="🔄 Restart ADB Server" Click="BtnRestartAdb_Click" 
+                           Margin="0,0,0,5" Background="{StaticResource PrimaryBrush}" Foreground="White" FontSize="11"/>
+                    
+                    <Button x:Name="btnRevokeAuth" Content="🔐 Revoke Authorization" Click="BtnRevokeAuth_Click" 
+                           Margin="0,0,0,15" Background="#FF9800" Foreground="White" FontSize="11" IsEnabled="False"/>
+                    
+                    <ListBox x:Name="lstDevices" SelectionChanged="LstDevices_SelectionChanged" 
+                            Height="200" BorderBrush="#E0E0E0">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Margin="5">
+                                    <TextBlock Text="{Binding DeviceName}" FontWeight="Bold"/>
+                                    <TextBlock Text="{Binding DeviceId}" FontSize="11" Foreground="Gray"/>
+                                    <TextBlock Text="{Binding Status}" FontSize="11" Foreground="{Binding StatusColor}"/>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <Separator Margin="0,15,0,15"/>
+
+                    <TextBlock Text="Recovery Options" FontSize="16" FontWeight="Bold" Margin="0,0,0,10"/>
+                    
+                    <CheckBox x:Name="chkPhotos" Content="Photos (JPG, PNG)" IsChecked="True" Margin="0,5"/>
+                    <CheckBox x:Name="chkVideos" Content="Videos (MP4, AVI)" IsChecked="True" Margin="0,5"/>
+                    <CheckBox x:Name="chkDocuments" Content="Documents (PDF, DOC)" IsChecked="True" Margin="0,5"/>
+                    <CheckBox x:Name="chkAudio" Content="Audio (MP3, WAV)" IsChecked="False" Margin="0,5"/>
+                    <CheckBox x:Name="chkOther" Content="Other Files" IsChecked="False" Margin="0,5"/>
+
+                    <Separator Margin="0,15,0,15"/>
+
+                    <TextBlock Text="Storage Path" FontSize="14" FontWeight="Bold" Margin="0,0,0,5"/>
+                    <TextBox x:Name="txtStoragePath" Text="/sdcard" Margin="0,0,0,10"/>
+                    
+                    <Button x:Name="btnStartScan" Content="🔍 Start Recovery Scan" 
+                           Click="BtnStartScan_Click" IsEnabled="False"
+                           Background="{StaticResource SecondaryBrush}" Foreground="White" Margin="0,5,0,5"/>
+                    
+                    <Button x:Name="btnStopScan" Content="⏹ Stop Scan" 
+                           Click="BtnStopScan_Click" IsEnabled="False" Margin="0,5,0,5"/>
+                </StackPanel>
+            </Border>
+
+            <!-- File List Panel -->
+            <Border Grid.Column="1" Background="{StaticResource CardBrush}" Padding="15" 
+                   BorderBrush="#E0E0E0" BorderThickness="1">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,15">
+                        <TextBlock Text="Recovered Files" FontSize="18" FontWeight="Bold"/>
+                        <TextBlock x:Name="txtFileCount" Text=" (0 files)" FontSize="18" Margin="10,0,0,0" 
+                                  Foreground="{StaticResource PrimaryBrush}"/>
+                    </StackPanel>
+
+                    <DataGrid x:Name="dgFiles" Grid.Row="1" AutoGenerateColumns="False" 
+                             CanUserAddRows="False" IsReadOnly="True" 
+                             SelectionChanged="DgFiles_SelectionChanged"
+                             BorderBrush="#E0E0E0">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="File Name" Binding="{Binding FileName}" Width="*"/>
+                            <DataGridTextColumn Header="Type" Binding="{Binding FileType}" Width="100"/>
+                            <DataGridTextColumn Header="Size" Binding="{Binding FileSize}" Width="100"/>
+                            <DataGridTextColumn Header="Path" Binding="{Binding Path}" Width="200"/>
+                            <DataGridTextColumn Header="Status" Binding="{Binding RecoveryStatus}" Width="150"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <Border Grid.Row="2" Background="#FFF3E0" Padding="10" Margin="0,15,0,0" 
+                           BorderBrush="#FFB74D" BorderThickness="1">
+                        <StackPanel>
+                            <TextBlock Text="Recovery Actions:" FontWeight="Bold" Margin="0,0,0,5"/>
+                            <StackPanel Orientation="Horizontal">
+                                <Button x:Name="btnRecoverSelected" Content="💾 Recover Selected" 
+                                       Click="BtnRecoverSelected_Click" IsEnabled="False"
+                                       Background="{StaticResource AccentBrush}" Foreground="White" Margin="0,0,10,0"/>
+                                <Button x:Name="btnRecoverAll" Content="💾 Recover All" 
+                                       Click="BtnRecoverAll_Click" IsEnabled="False"
+                                       Background="{StaticResource AccentBrush}" Foreground="White" Margin="0,0,10,0"/>
+                                <TextBlock x:Name="txtProgress" Text="" VerticalAlignment="Center" 
+                                          Foreground="{StaticResource SecondaryBrush}"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- Status Bar -->
+        <Border Grid.Row="2" Background="#EEEEEE" Padding="10" Margin="0,20,0,0">
+            <TextBlock x:Name="txtStatus" Text="Ready. Connect your Android device via USB and enable USB debugging." 
+                      FontSize="12"/>
+        </Border>
+    </Grid>
+</Window>
+

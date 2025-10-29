@@ -1,0 +1,15 @@
+<Application x:Class="AndroidRecoveryTool.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <SolidColorBrush x:Key="PrimaryBrush" Color="#2196F3"/>
+            <SolidColorBrush x:Key="SecondaryBrush" Color="#FF5722"/>
+            <SolidColorBrush x:Key="BackgroundBrush" Color="#F5F5F5"/>
+            <SolidColorBrush x:Key="CardBrush" Color="#FFFFFF"/>
+            <SolidColorBrush x:Key="AccentBrush" Color="#4CAF50"/>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>
+

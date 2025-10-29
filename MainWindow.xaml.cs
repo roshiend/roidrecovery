@@ -386,6 +386,7 @@ namespace AndroidRecoveryTool
                     // Hide all preview types first
                     imgPreview.Visibility = Visibility.Collapsed;
                     pnlTextPreview.Visibility = Visibility.Collapsed;
+                    pnlVideoPreview.Visibility = Visibility.Collapsed;
                     pnlFileInfo.Visibility = Visibility.Visible;
                 });
 
@@ -400,9 +401,10 @@ namespace AndroidRecoveryTool
                 {
                     await LoadTextPreviewAsync(file);
                 }
-                else if (fileType == "MP4" || fileType == "AVI" || fileType == "MKV" || fileType == "MOV")
+                else if (fileType == "MP4" || fileType == "AVI" || fileType == "MKV" || fileType == "MOV" || 
+                         fileType == "M4V" || fileType == "FLV" || fileType == "WMV" || fileType == "3GP")
                 {
-                    ShowVideoInfo(file);
+                    await LoadVideoPreviewAsync(file);
                 }
                 else if (fileType == "MP3" || fileType == "WAV" || fileType == "M4A" || fileType == "AAC")
                 {
@@ -851,6 +853,201 @@ namespace AndroidRecoveryTool
             }
         }
 
+        private async Task LoadVideoPreviewAsync(RecoverableFile file)
+        {
+            try
+            {
+                if (_selectedDeviceId == null)
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        txtNoPreview.Text = "No device selected";
+                        txtNoPreview.Visibility = Visibility.Visible;
+                    });
+                    return;
+                }
+
+                // Don't preview very large videos (> 100MB) to save time
+                if (file.SizeInBytes > 100 * 1024 * 1024)
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        txtNoPreview.Text = "Video too large for preview (max 100MB)\n\nFile size: " + file.FileSize + "\n\nPlease recover the file to view it.";
+                        txtNoPreview.Visibility = Visibility.Visible;
+                        txtPreviewLoadingStatus.Text = "Too large";
+                        pnlFileInfo.Visibility = Visibility.Visible;
+                    });
+                    return;
+                }
+
+                Dispatcher.Invoke(() =>
+                {
+                    txtPreviewLoadingStatus.Text = "Downloading video for preview...";
+                });
+
+                // Pull file temporarily for preview
+                var tempDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryPreview");
+                Directory.CreateDirectory(tempDir);
+                var extension = Path.GetExtension(file.DevicePath).TrimStart('.').ToLower();
+                if (string.IsNullOrEmpty(extension))
+                    extension = file.FileType.ToLower();
+                var tempFilePath = Path.Combine(tempDir, $"preview_{Guid.NewGuid()}.{extension}");
+
+                try
+                {
+                    // First verify file exists on device using direct ADB shell command
+                    var testResult = await _adbService.ExecuteShellCommandAsync(_selectedDeviceId, $"test -f \"{file.DevicePath}\" && echo EXISTS");
+                    bool fileExists = testResult.Contains("EXISTS");
+
+                    if (!fileExists)
+                    {
+                        // File doesn't exist - attempt to recover it temporarily for preview
+                        Dispatcher.Invoke(() =>
+                        {
+                            txtPreviewLoadingStatus.Text = "Recovering video for preview...";
+                            txtNoPreview.Text = "Recovering deleted video temporarily for preview...\n\nThis may take a moment for large files.";
+                            txtNoPreview.Visibility = Visibility.Visible;
+                        });
+                        
+                        // Try to recover file temporarily to preview location
+                        var tempRecoveryDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryPreview");
+                        Directory.CreateDirectory(tempRecoveryDir);
+                        
+                        // Create a copy of the file object to avoid modifying the original
+                        var fileCopy = new RecoverableFile
+                        {
+                            DevicePath = file.DevicePath,
+                            FileName = file.FileName,
+                            FileType = file.FileType,
+                            SizeInBytes = file.SizeInBytes,
+                            RecoveryStatus = file.RecoveryStatus
+                        };
+                        
+                        var recoverySuccess = await _recoveryService.RecoverFileAsync(
+                            _selectedDeviceId!,
+                            fileCopy,
+                            tempRecoveryDir
+                        );
+                        
+                        // Check if file was recovered - it will have updated DevicePath to local path
+                        if (recoverySuccess && !string.IsNullOrEmpty(fileCopy.DevicePath) && File.Exists(fileCopy.DevicePath))
+                        {
+                            // Update tempFilePath to use recovered file
+                            tempFilePath = fileCopy.DevicePath;
+                            fileExists = true;
+                            
+                            Dispatcher.Invoke(() =>
+                            {
+                                txtPreviewLoadingStatus.Text = "Video recovered - loading preview...";
+                            });
+                        }
+                        else
+                        {
+                            // Recovery failed - show error
+                            Dispatcher.Invoke(() =>
+                            {
+                                txtNoPreview.Text = $"⚠️ Cannot preview this deleted video.\n\nThe video cannot be temporarily recovered for preview.\n\nPossible reasons:\n• File is permanently overwritten\n• Requires root access for deep recovery\n• Video is corrupted\n• File is too large\n\nTry recovering it permanently to see if it's still intact.";
+                                txtNoPreview.Visibility = Visibility.Visible;
+                                txtPreviewLoadingStatus.Text = "Preview unavailable";
+                                pnlFileInfo.Visibility = Visibility.Visible;
+                            });
+                            return;
+                        }
+                    }
+
+                    // Use ADB pull only if file wasn't already recovered for preview
+                    if (!fileExists || !File.Exists(tempFilePath))
+                    {
+                        var processInfo = new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = _adbService.GetAdbPath(),
+                            Arguments = $"-s {_selectedDeviceId} pull \"{file.DevicePath}\" \"{tempFilePath}\"",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true,
+                            WorkingDirectory = Path.GetDirectoryName(_adbService.GetAdbPath())
+                        };
+
+                        using var process = System.Diagnostics.Process.Start(processInfo);
+                        if (process != null)
+                        {
+                            var output = await process.StandardOutput.ReadToEndAsync();
+                            var error = await process.StandardError.ReadToEndAsync();
+                            await process.WaitForExitAsync();
+                            
+                            // Wait for file to be written
+                            await Task.Delay(1000);
+                        }
+                    }
+                    
+                    // Load video preview if file exists (either from recovery or pull)
+                    if (File.Exists(tempFilePath) && new FileInfo(tempFilePath).Length > 0)
+                    {
+                        Dispatcher.Invoke(() =>
+                        {
+                            try
+                            {
+                                // Set video source
+                                mediaVideoPreview.Source = new Uri(tempFilePath, UriKind.Absolute);
+                                pnlVideoPreview.Visibility = Visibility.Visible;
+                                imgPreview.Visibility = Visibility.Collapsed;
+                                pnlTextPreview.Visibility = Visibility.Collapsed;
+                                txtNoPreview.Visibility = Visibility.Collapsed;
+                                txtPreviewLoadingStatus.Text = "Video loaded - Click Play to preview";
+                                pnlFileInfo.Visibility = Visibility.Visible;
+                                
+                                // Enable video controls
+                                btnPlayVideo.IsEnabled = true;
+                                btnPauseVideo.IsEnabled = false;
+                                btnStopVideo.IsEnabled = false;
+                            }
+                            catch (Exception ex)
+                            {
+                                txtNoPreview.Text = $"Could not load video: {ex.Message}\n\nFile may be corrupted or format not supported.";
+                                txtNoPreview.Visibility = Visibility.Visible;
+                                txtPreviewLoadingStatus.Text = "Error loading video";
+                                pnlVideoPreview.Visibility = Visibility.Collapsed;
+                            }
+                        });
+                    }
+                    else
+                    {
+                        Dispatcher.Invoke(() =>
+                        {
+                            txtNoPreview.Text = $"Video file not accessible.\n\nPath: {file.DevicePath}\n\nThis video may need to be recovered first.";
+                            txtNoPreview.Visibility = Visibility.Visible;
+                            txtPreviewLoadingStatus.Text = "File not found";
+                            pnlFileInfo.Visibility = Visibility.Visible;
+                        });
+                    }
+                }
+                finally
+                {
+                    // Cleanup temp file after a delay (user might still be viewing)
+                    _ = Task.Delay(120000).ContinueWith(_ =>
+                    {
+                        try
+                        {
+                            if (File.Exists(tempFilePath))
+                                File.Delete(tempFilePath);
+                        }
+                        catch { }
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    txtNoPreview.Text = $"Video preview error: {ex.Message}";
+                    txtNoPreview.Visibility = Visibility.Visible;
+                    pnlVideoPreview.Visibility = Visibility.Collapsed;
+                    txtPreviewLoadingStatus.Text = "Error";
+                });
+            }
+        }
+
         private void ShowVideoInfo(RecoverableFile file)
         {
                 Dispatcher.Invoke(() =>
@@ -875,6 +1072,51 @@ namespace AndroidRecoveryTool
                 });
         }
 
+        private void BtnPlayVideo_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                mediaVideoPreview.Play();
+                btnPlayVideo.IsEnabled = false;
+                btnPauseVideo.IsEnabled = true;
+                btnStopVideo.IsEnabled = true;
+            }
+            catch (Exception ex)
+            {
+                System.Windows.MessageBox.Show($"Error playing video: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void BtnPauseVideo_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                mediaVideoPreview.Pause();
+                btnPlayVideo.IsEnabled = true;
+                btnPauseVideo.IsEnabled = false;
+            }
+            catch { }
+        }
+
+        private void BtnStopVideo_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                mediaVideoPreview.Stop();
+                btnPlayVideo.IsEnabled = true;
+                btnPauseVideo.IsEnabled = false;
+                btnStopVideo.IsEnabled = false;
+            }
+            catch { }
+        }
+
+        private void MediaVideoPreview_MediaEnded(object sender, RoutedEventArgs e)
+        {
+            btnPlayVideo.IsEnabled = true;
+            btnPauseVideo.IsEnabled = false;
+            btnStopVideo.IsEnabled = false;
+        }
+
         private void ClearPreview()
         {
             txtNoPreview.Visibility = Visibility.Visible;
@@ -882,6 +1124,7 @@ namespace AndroidRecoveryTool
             txtPreviewLoadingStatus.Text = "";
             imgPreview.Visibility = Visibility.Collapsed;
             pnlTextPreview.Visibility = Visibility.Collapsed;
+            pnlVideoPreview.Visibility = Visibility.Collapsed;
             imgPreview.Source = null;
             txtPreview.Text = "";
             txtPreviewFileName.Text = "";
@@ -890,6 +1133,11 @@ namespace AndroidRecoveryTool
             txtPreviewPath.Text = "";
             txtPreviewStatus.Text = "";
             txtPreviewDevicePath.Text = "";
+            // Stop and clear video
+            mediaVideoPreview.Source = null;
+            btnPlayVideo.IsEnabled = false;
+            btnPauseVideo.IsEnabled = false;
+            btnStopVideo.IsEnabled = false;
         }
 
         private async void BtnRecoverSelected_Click(object sender, RoutedEventArgs e)

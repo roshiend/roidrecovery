@@ -58,21 +58,35 @@ namespace AndroidRecoveryTool.Services
                     $"{storagePath}/Android/data/com.google.android.apps.photos/files/Trash",
                     $"{storagePath}/DCIM/.cache",
                     
+                    // Video-specific locations (videos are often stored and deleted from here)
+                    $"{storagePath}/DCIM/Camera",
+                    $"{storagePath}/Movies",
+                    $"{storagePath}/Videos",
+                    $"{storagePath}/Android/data/com.android.providers.media/thumbnail",
+                    $"{storagePath}/Android/data/com.google.android.apps.photos/files/videos",
+                    
                     // Gallery deleted files (Samsung, Xiaomi, Huawei)
                     $"{storagePath}/.trash",
                     $"{storagePath}/.samsung.deleted",
                     $"{storagePath}/.recycle",
                     $"{storagePath}/.deleted_files",
                     
-                    // WhatsApp/T messaging deleted media
+                    // WhatsApp/T messaging deleted media (includes videos)
                     $"{storagePath}/WhatsApp/Media/.Statuses",
+                    $"{storagePath}/WhatsApp/Media/Video",
                     $"{storagePath}/WhatsApp/.Shared",
                     $"{storagePath}/Android/media/com.whatsapp/WhatsApp/.Statuses",
+                    $"{storagePath}/Android/media/com.whatsapp/WhatsApp/Media/Video",
                     
                     // Gallery cache and thumbnails (often contain deleted file data)
                     $"{storagePath}/DCIM/Camera/.thumbdata",
                     $"{storagePath}/Android/data/com.android.gallery3d/files/",
                     $"{storagePath}/Android/data/com.miui.gallery/files/",
+                    $"{storagePath}/Android/data/com.samsung.android.gallery3d/cache",
+                    
+                    // Video player cache locations
+                    $"{storagePath}/Android/data/com.mxtech.videoplayer.ad/cache",
+                    $"{storagePath}/Android/data/com.videoplayer/thumbnail",
                     
                     // Other deleted file locations
                     $"{storagePath}/Lost.Dir",  // Android's lost+found
@@ -133,8 +147,28 @@ namespace AndroidRecoveryTool.Services
                 
                 try
                 {
-                    // Look for files in unusual locations that might indicate deletion
-                    var orphanedCommand = $"find \"{storagePath}\" -type f -name \"*.jpg\" -o -name \"*.png\" -o -name \"*.mp4\" 2>/dev/null | grep -E '(\\.(thumb|cache|deleted|recycle|trash)|Lost\\.Dir)' | head -1000";
+                    // Build find command with all file extensions based on what we're scanning
+                    var findExtensions = new List<string>();
+                    if (scanPhotos)
+                    {
+                        findExtensions.AddRange(new[] { "*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp" });
+                    }
+                    if (scanVideos)
+                    {
+                        findExtensions.AddRange(new[] { "*.mp4", "*.avi", "*.mkv", "*.mov", "*.3gp", "*.m4v", "*.flv", "*.wmv" });
+                    }
+                    if (scanDocuments)
+                    {
+                        findExtensions.AddRange(new[] { "*.pdf", "*.doc", "*.docx", "*.txt", "*.xls", "*.xlsx" });
+                    }
+                    if (scanAudio)
+                    {
+                        findExtensions.AddRange(new[] { "*.mp3", "*.wav", "*.m4a", "*.aac", "*.ogg" });
+                    }
+                    
+                    // Build find command with all extensions
+                    var findPatterns = string.Join(" -o ", findExtensions.Select(ext => $"-name \"{ext}\""));
+                    var orphanedCommand = $"find \"{storagePath}\" -type f \\( {findPatterns} \\) 2>/dev/null | grep -E '(\\.(thumb|cache|deleted|recycle|trash)|Lost\\.Dir|lost\\+found)' | head -2000";
                     var orphanedOutput = await _adbService.ExecuteShellCommandAsync(deviceId, orphanedCommand);
                     
                     if (!string.IsNullOrWhiteSpace(orphanedOutput))
@@ -318,6 +352,9 @@ namespace AndroidRecoveryTool.Services
                 extensions.Add("MKV");
                 extensions.Add("MOV");
                 extensions.Add("3GP");
+                extensions.Add("M4V");
+                extensions.Add("FLV");
+                extensions.Add("WMV");
             }
 
             if (documents)
@@ -405,6 +442,9 @@ namespace AndroidRecoveryTool.Services
                     "MKV" => "MKV",
                     "MOV" => "MOV",
                     "3GP" => "3GP",
+                    "M4V" => "M4V",
+                    "FLV" => "FLV",
+                    "WMV" => "WMV",
                     "PDF" => "PDF",
                     "DOC" => "DOC",
                     "DOCX" => "DOCX",
@@ -446,6 +486,9 @@ namespace AndroidRecoveryTool.Services
                 types.Add("MKV");
                 types.Add("MOV");
                 types.Add("3GP");
+                types.Add("M4V");
+                types.Add("FLV");
+                types.Add("WMV");
             }
 
             if (documents)
@@ -825,6 +868,8 @@ namespace AndroidRecoveryTool.Services
                 { "AVI", new FileSignatureInfo { Header = new byte[] { 0x52, 0x49, 0x46, 0x46 }, FooterPattern = "AVI ", Extensions = new[] { ".avi" } } },
                 { "MKV", new FileSignatureInfo { Header = new byte[] { 0x1A, 0x45, 0xDF, 0xA3 }, Extensions = new[] { ".mkv" } } },
                 { "MOV", new FileSignatureInfo { Header = new byte[] { 0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x71, 0x74, 0x20, 0x20 }, Extensions = new[] { ".mov" } } },
+                { "FLV", new FileSignatureInfo { Header = new byte[] { 0x46, 0x4C, 0x56, 0x01 }, Extensions = new[] { ".flv" } } },
+                { "WMV", new FileSignatureInfo { Header = new byte[] { 0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11 }, Extensions = new[] { ".wmv", ".asf" } } },
                 
                 // Audio
                 { "MP3", new FileSignatureInfo { Header = new byte[] { 0xFF, 0xFB }, Extensions = new[] { ".mp3" } } },
@@ -967,33 +1012,41 @@ namespace AndroidRecoveryTool.Services
                     var hexHeader = string.Join("", sigInfo.Header.Select(b => $"\\\\x{b:X2}"));
                     var hexPattern = string.Join(" ", sigInfo.Header.Select(b => $"{b:X2}"));
                     
-                    // Search for signatures using hexdump/grep
-                    // Note: Using a simpler approach due to shell escaping complexity
-                    var searchCmd = $"find \"{path}\" -type f 2>/dev/null | head -50";
-                    
-                    var results = await _adbService.ExecuteShellCommandAsync(deviceId, searchCmd);
-                    
-                    if (!string.IsNullOrWhiteSpace(results))
+                    // Search for files by extension first (faster and more reliable)
+                    var extensionPatterns = sigInfo.Extensions.Select(ext => $"*{ext}").ToList();
+                    if (extensionPatterns.Any())
                     {
-                        var files = results.Split('\n')
-                            .Where(f => !string.IsNullOrWhiteSpace(f))
-                            .ToList();
+                        var extPatterns = string.Join(" -o ", extensionPatterns.Select(ext => $"-name \"{ext}\""));
+                        var searchCmd = $"find \"{path}\" -type f \\( {extPatterns} \\) 2>/dev/null | head -200";
                         
-                        foundFiles.AddRange(files);
-                        ProgressUpdate?.Invoke(this, $"✓ Found {files.Count} potential {sigName} files");
+                        var results = await _adbService.ExecuteShellCommandAsync(deviceId, searchCmd);
+                        
+                        if (!string.IsNullOrWhiteSpace(results))
+                        {
+                            var files = results.Split('\n')
+                                .Where(f => !string.IsNullOrWhiteSpace(f))
+                                .ToList();
+                            
+                            foundFiles.AddRange(files);
+                            ProgressUpdate?.Invoke(this, $"✓ Found {files.Count} potential {sigName} files by extension");
+                        }
                     }
                     
-                    // Also try alternative: scan using file command
-                    var fileCmd = $"find \"{path}\" -type f 2>/dev/null -exec file {{}} \\; | grep -i \"{sigName.ToLower()}\" | cut -d: -f1 | head -50";
+                    // Also try alternative: scan using file command for type detection
+                    var fileCmd = $"find \"{path}\" -type f 2>/dev/null -exec file {{}} + 2>/dev/null | grep -iE \"({sigName.ToLower()}|{string.Join("|", sigInfo.Extensions.Select(e => e.TrimStart('.').ToLower()))})\" | cut -d: -f1 | head -100";
                     var fileResults = await _adbService.ExecuteShellCommandAsync(deviceId, fileCmd);
                     
                     if (!string.IsNullOrWhiteSpace(fileResults))
                     {
                         var moreFiles = fileResults.Split('\n')
-                            .Where(f => !string.IsNullOrWhiteSpace(f))
+                            .Where(f => !string.IsNullOrWhiteSpace(f) && !foundFiles.Contains(f))
                             .ToList();
                         
-                        foundFiles.AddRange(moreFiles);
+                        if (moreFiles.Any())
+                        {
+                            foundFiles.AddRange(moreFiles);
+                            ProgressUpdate?.Invoke(this, $"✓ Found {moreFiles.Count} additional {sigName} files by file type");
+                        }
                     }
                 }
             }

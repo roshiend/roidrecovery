@@ -2,10 +2,15 @@ using System;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Forms;
+using System.Windows.Media.Imaging;
+using System.Windows.Media;
+using System.Security.Cryptography;
+using System.Text;
 using AndroidRecoveryTool.Models;
 using AndroidRecoveryTool.Services;
 
@@ -19,6 +24,8 @@ namespace AndroidRecoveryTool
         private readonly ObservableCollection<RecoverableFile> _recoverableFiles;
         private string? _selectedDeviceId;
         private string _recoveryDestinationPath = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        private readonly SemaphoreSlim _thumbLimiter = new SemaphoreSlim(2);
+        private readonly bool _enableVideoThumbnails = false; // optimization: skip heavy video thumbnailing by default
 
         public MainWindow()
         {
@@ -346,16 +353,32 @@ namespace AndroidRecoveryTool
         {
             try
             {
-                if (_selectedDeviceId == null) return;
+                if (_selectedDeviceId == null)
+                {
+                    return;
+                }
 
                 // Only load thumbnails for images and videos
                 var fileType = file.FileType.ToUpper();
                 bool isImage = fileType == "JPG" || fileType == "JPEG" || fileType == "PNG" || fileType == "GIF" || fileType == "WEBP";
                 bool isVideo = fileType == "MP4" || fileType == "AVI" || fileType == "MKV" || fileType == "MOV" || 
                               fileType == "M4V" || fileType == "FLV" || fileType == "WMV" || fileType == "3GP";
+                bool isAudio = fileType == "MP3" || fileType == "WAV" || fileType == "M4A" || fileType == "AAC" || fileType == "OGG" || fileType == "FLAC";
+                bool isDoc = fileType == "PDF" || fileType == "DOC" || fileType == "DOCX" || fileType == "PPT" || fileType == "PPTX" || fileType == "XLS" || fileType == "XLSX" || fileType == "TXT";
 
-                if (!isImage && !isVideo) return;
+                if (!isImage && !isVideo && !isAudio && !isDoc) return;
 
+                // Check cache first
+                var cachePath = GetThumbnailCachePath(_selectedDeviceId, file);
+                if (File.Exists(cachePath) && new FileInfo(cachePath).Length > 0)
+                {
+                    Dispatcher.Invoke(() => { file.ThumbnailPath = cachePath; });
+                    return;
+                }
+
+                await _thumbLimiter.WaitAsync();
+                try
+                {
                 // Create thumbnail directory
                 var thumbDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryThumbnails");
                 Directory.CreateDirectory(thumbDir);
@@ -401,19 +424,694 @@ namespace AndroidRecoveryTool
                 }
                 else if (isVideo)
                 {
-                    // For videos, show a video icon or extract thumbnail frame
-                    // For now, just use a placeholder - could use ffmpeg later
-                    Dispatcher.Invoke(() =>
+                    // Optimization: skip video thumbnails by default (heavy and slow on USB)
+                    // Always show a generic video placeholder instead of black frames
+                    try
                     {
-                        // Set a placeholder path or null - we'll handle this in the template
-                        file.ThumbnailPath = "";
-                    });
+                        if (File.Exists(cachePath))
+                        {
+                            // Remove any previously cached black thumbnails
+                            File.Delete(cachePath);
+                        }
+                    }
+                    catch { }
+                    Dispatcher.Invoke(() => { file.ThumbnailPath = string.Empty; });
+                    return;
+                }
+                else if (isAudio)
+                {
+                    var ok = await ExtractAudioThumbnailAsync(file, cachePath);
+                    if (ok)
+                    {
+                        return;
+                    }
+                }
+                else if (isDoc)
+                {
+                    var ok = await ExtractDocumentThumbnailAsync(file, cachePath);
+                    if (ok)
+                    {
+                        return;
+                    }
+                }
+                }
+                finally
+                {
+                    _thumbLimiter.Release();
                 }
             }
             catch
             {
                 // Silently fail - thumbnails are optional
             }
+        }
+
+        private async Task<bool> ExtractVideoThumbnailAsync(RecoverableFile file, string cachePath)
+        {
+            try
+            {
+                if (_selectedDeviceId == null)
+                {
+                    return false;
+                }
+
+                // Cap work for very large videos (> 200MB) to avoid heavy transfers
+                if (file.SizeInBytes > 200 * 1024 * 1024) return false;
+
+                // Create thumbnail directory
+                var thumbDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryThumbnails");
+                Directory.CreateDirectory(thumbDir);
+                var thumbPath = Path.Combine(thumbDir, $"thumb_{Guid.NewGuid()}.jpg");
+
+                // Check if file exists on device
+                var testResult = await _adbService.ExecuteShellCommandAsync(_selectedDeviceId, $"test -f \"{file.DevicePath}\" && echo EXISTS");
+                bool existsOnDevice = testResult.Contains("EXISTS");
+
+                // Pull video file temporarily (we'll delete it after extracting frame)
+                var tempVideoDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryVideoThumbs");
+                Directory.CreateDirectory(tempVideoDir);
+                var extension = Path.GetExtension(file.DevicePath).TrimStart('.').ToLower();
+                if (string.IsNullOrEmpty(extension))
+                    extension = file.FileType.ToLower();
+                var tempVideoPath = Path.Combine(tempVideoDir, $"temp_{Guid.NewGuid()}.{extension}");
+
+                // Try fast path: use ffmpeg if available and pull only first 8 MB (often enough for a keyframe)
+                var ffmpegPath = GetFfmpegPath();
+                var ffprobePath = GetFfprobePath();
+                bool usedFfmpeg = false;
+                if (!string.IsNullOrEmpty(ffmpegPath) && File.Exists(ffmpegPath))
+                {
+                    try
+                    {
+                        // Attempt partial pull via exec-out + redirection (Windows-only)
+                        // This streams first 8MB from device to local file; if it fails, we'll fall back
+                        var cmd = $"\"{_adbService.GetAdbPath()}\" -s {_selectedDeviceId} exec-out \"dd if='{file.DevicePath}' bs=1M count=8\" > \"{tempVideoPath}\"";
+                        var psi = new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = "cmd.exe",
+                            Arguments = "/c " + cmd,
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true
+                        };
+                        using (var proc = System.Diagnostics.Process.Start(psi))
+                        {
+                            if (proc != null)
+                            {
+                                await proc.WaitForExitAsync();
+                            }
+                        }
+
+                        // If partial file is too small or missing, fall back to full pull (only if <= 50MB)
+                        var partialOk = File.Exists(tempVideoPath) && new FileInfo(tempVideoPath).Length > (512 * 1024);
+                        if (!partialOk)
+                        {
+                            if (existsOnDevice && file.SizeInBytes <= 50 * 1024 * 1024)
+                            {
+                                var pullFull = new System.Diagnostics.ProcessStartInfo
+                                {
+                                    FileName = _adbService.GetAdbPath(),
+                                    Arguments = $"-s {_selectedDeviceId} pull \"{file.DevicePath}\" \"{tempVideoPath}\"",
+                                    UseShellExecute = false,
+                                    RedirectStandardOutput = true,
+                                    RedirectStandardError = true,
+                                    CreateNoWindow = true,
+                                    WorkingDirectory = Path.GetDirectoryName(_adbService.GetAdbPath()) ?? ""
+                                };
+                                using var pullProc = System.Diagnostics.Process.Start(pullFull);
+                                if (pullProc != null)
+                                {
+                                    await pullProc.WaitForExitAsync();
+                                }
+                            }
+                        }
+
+                        if (File.Exists(tempVideoPath) && new FileInfo(tempVideoPath).Length > 0)
+                        {
+                            // Determine a good timestamp via ffprobe (20% of duration), fallback to 1s
+                            double ts = 1;
+                            if (!string.IsNullOrEmpty(ffprobePath) && File.Exists(ffprobePath))
+                            {
+                                var dur = await GetVideoDurationSecondsAsync(ffprobePath, tempVideoPath);
+                                if (dur > 3) ts = Math.Min(Math.Max(1, dur * 0.2), dur - 1);
+                            }
+
+                            // Use ffmpeg to extract a frame (scaled thumbnail)
+                            var ffArgs = $"-y -ss {ts.ToString(System.Globalization.CultureInfo.InvariantCulture)} -noaccurate_seek -i \"{tempVideoPath}\" -frames:v 1 -q:v 3 -vf scale=-2:180 \"{thumbPath}\"";
+                            var ffpsi = new System.Diagnostics.ProcessStartInfo
+                            {
+                                FileName = ffmpegPath,
+                                Arguments = ffArgs,
+                                UseShellExecute = false,
+                                RedirectStandardOutput = true,
+                                RedirectStandardError = true,
+                                CreateNoWindow = true
+                            };
+                            using var ff = System.Diagnostics.Process.Start(ffpsi);
+                            if (ff != null)
+                            {
+                                await ff.WaitForExitAsync();
+                            }
+
+                            if (File.Exists(thumbPath) && new FileInfo(thumbPath).Length > 0)
+                            {
+                                usedFfmpeg = true;
+                                // Save to cache and set path
+                                try { File.Copy(thumbPath, cachePath, true); } catch { }
+                                Dispatcher.Invoke(() => { file.ThumbnailPath = cachePath; });
+                                return true;
+                            }
+                            else
+                            {
+                                // Retry at later timestamps to avoid black frames
+                                foreach (var offset in new[] { 3, 5 })
+                                {
+                                    var ts2 = ts + offset;
+                                    var ffArgs2 = $"-y -ss {ts2.ToString(System.Globalization.CultureInfo.InvariantCulture)} -noaccurate_seek -i \"{tempVideoPath}\" -frames:v 1 -q:v 3 -vf scale=-2:180 \"{thumbPath}\"";
+                                    var ffpsi2 = new System.Diagnostics.ProcessStartInfo
+                                    {
+                                        FileName = ffmpegPath,
+                                        Arguments = ffArgs2,
+                                        UseShellExecute = false,
+                                        RedirectStandardOutput = true,
+                                        RedirectStandardError = true,
+                                        CreateNoWindow = true
+                                    };
+                                    using var ff2 = System.Diagnostics.Process.Start(ffpsi2);
+                                    if (ff2 != null) await ff2.WaitForExitAsync();
+                                    if (File.Exists(thumbPath) && new FileInfo(thumbPath).Length > 0)
+                                    {
+                                        usedFfmpeg = true;
+                                        try { File.Copy(thumbPath, cachePath, true); } catch { }
+                                        Dispatcher.Invoke(() => { file.ThumbnailPath = cachePath; });
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                // If ffmpeg path not found or failed, fall back to WPF capture approach
+                if (!usedFfmpeg)
+                {
+                    if (!existsOnDevice)
+                    {
+                        // If deleted and not recoverable for thumbnail quickly, skip
+                        if (file.SizeInBytes > 100 * 1024 * 1024) return false;
+
+                        try
+                        {
+                            var tempRecoveryDir = tempVideoDir;
+                            var fileCopy = new RecoverableFile
+                            {
+                                DevicePath = file.DevicePath,
+                                FileName = file.FileName,
+                                FileType = file.FileType,
+                                SizeInBytes = file.SizeInBytes,
+                                RecoveryStatus = file.RecoveryStatus
+                            };
+
+                            var recoverySuccess = await _recoveryService.RecoverFileAsync(_selectedDeviceId!, fileCopy, tempRecoveryDir);
+                            if (recoverySuccess && !string.IsNullOrEmpty(fileCopy.DevicePath) && File.Exists(fileCopy.DevicePath))
+                            {
+                                tempVideoPath = fileCopy.DevicePath; // Use recovered local file
+                            }
+                            else
+                            {
+                                return false; // Cannot produce thumbnail
+                            }
+                        }
+                        catch { return false; }
+                    }
+
+                    // If tempVideoPath is still empty or missing, attempt a small full pull (<= 50MB)
+                    if (!File.Exists(tempVideoPath))
+                    {
+                        if (!existsOnDevice || file.SizeInBytes > 50 * 1024 * 1024) return false;
+
+                        var pullProcess = new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = _adbService.GetAdbPath(),
+                            Arguments = $"-s {_selectedDeviceId} pull \"{file.DevicePath}\" \"{tempVideoPath}\"",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true,
+                            WorkingDirectory = Path.GetDirectoryName(_adbService.GetAdbPath()) ?? ""
+                        };
+
+                        using var pullProc = System.Diagnostics.Process.Start(pullProcess);
+                        if (pullProc != null)
+                        {
+                            await pullProc.WaitForExitAsync();
+                        }
+                    }
+
+                    if (!File.Exists(tempVideoPath)) return false;
+
+                    try
+                {
+                        // Extract frame using MediaElement on a background thread
+                        await Task.Run(() =>
+                        {
+                                try
+                                {
+                                    // Use dispatcher to create MediaElement on UI thread
+                                    MediaElement? mediaElement = null;
+                                    ManualResetEvent frameReady = new ManualResetEvent(false);
+                                    bool frameCaptured = false;
+
+                                    Dispatcher.Invoke(() =>
+                                    {
+                                        mediaElement = new MediaElement
+                                        {
+                                            LoadedBehavior = MediaState.Manual,
+                                            UnloadedBehavior = MediaState.Manual,
+                                            ScrubbingEnabled = true,
+                                            Volume = 0 // Mute
+                                        };
+
+                                        // Mount into hidden host so it participates in the visual tree
+                                        try
+                                        {
+                                            hiddenMediaHost.Children.Clear();
+                                            hiddenMediaHost.Children.Add(mediaElement);
+                                            hiddenMediaHost.UpdateLayout();
+                                        }
+                                        catch { }
+
+                                        mediaElement.MediaOpened += async (s, e) =>
+                                        {
+                                            try
+                                            {
+                                                // Seek to 1 second (or start) to get a good frame
+                                                mediaElement.Position = TimeSpan.FromSeconds(1);
+                                                mediaElement.Pause();
+
+                                                // Give layout/rendering a moment
+                                                await Task.Delay(400);
+                                                hiddenMediaHost.UpdateLayout();
+
+                                                int width = (int)(mediaElement.NaturalVideoWidth > 0 ? mediaElement.NaturalVideoWidth : 640);
+                                                int height = (int)(mediaElement.NaturalVideoHeight > 0 ? mediaElement.NaturalVideoHeight : 360);
+
+                                                // Render the host containing the MediaElement
+                                                var renderTargetBitmap = new System.Windows.Media.Imaging.RenderTargetBitmap(
+                                                    width,
+                                                    height,
+                                                    96,
+                                                    96,
+                                                    System.Windows.Media.PixelFormats.Pbgra32);
+
+                                                renderTargetBitmap.Render(hiddenMediaHost);
+
+                                                // Save as JPEG
+                                                var jpegEncoder = new System.Windows.Media.Imaging.JpegBitmapEncoder
+                                                {
+                                                    QualityLevel = 85
+                                                };
+                                                jpegEncoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(renderTargetBitmap));
+
+                                                using (var fileStream = new FileStream(thumbPath, FileMode.Create))
+                                                {
+                                                    jpegEncoder.Save(fileStream);
+                                                }
+
+                                                frameCaptured = true;
+                                            }
+                                            catch { }
+                                            finally
+                                            {
+                                                mediaElement.Close();
+                                                frameReady.Set();
+                                            }
+                                        };
+
+                                        mediaElement.MediaFailed += (s, e) =>
+                                        {
+                                            try { mediaElement?.Close(); } catch { }
+                                            frameReady.Set();
+                                        };
+
+                                        // Open video
+                                        mediaElement.Source = new Uri(tempVideoPath, UriKind.Absolute);
+                                        mediaElement.Play();
+                                    });
+
+                                    // Wait up to 10 seconds for frame extraction
+                                    if (frameReady.WaitOne(10000) && frameCaptured && File.Exists(thumbPath))
+                                    {
+                                        // Update thumbnail path on UI thread
+                                        Dispatcher.Invoke(() =>
+                                        {
+                                            file.ThumbnailPath = thumbPath;
+                                        });
+                                    }
+
+                                    // Cleanup MediaElement
+                                    Dispatcher.Invoke(() =>
+                                    {
+                                        try
+                                        {
+                                            if (mediaElement != null)
+                                            {
+                                                mediaElement.Close();
+                                                mediaElement = null;
+                                            }
+                                        }
+                                        catch { }
+                                    });
+                                }
+                                catch { }
+                        });
+
+                        // Cleanup temp video file
+                        try
+                        {
+                            await Task.Delay(300);
+                            File.Delete(tempVideoPath);
+                        }
+                        catch { }
+                    }
+                    catch { }
+                }
+                if (File.Exists(thumbPath) && new FileInfo(thumbPath).Length > 0)
+                {
+                    try { File.Copy(thumbPath, cachePath, true); } catch { }
+                    Dispatcher.Invoke(() => { file.ThumbnailPath = cachePath; });
+                    return true;
+                }
+                return false;
+            }
+            catch
+            {
+                // Silently fail - thumbnails are optional
+                return false;
+            }
+        }
+
+        private string GetFfmpegPath()
+        {
+            try
+            {
+                var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                var local = Path.Combine(baseDir, "ffmpeg", "ffmpeg.exe");
+                if (File.Exists(local)) return local;
+                // Also try alongside executable
+                var inRoot = Path.Combine(baseDir, "ffmpeg.exe");
+                if (File.Exists(inRoot)) return inRoot;
+            }
+            catch { }
+            return string.Empty;
+        }
+
+        private string GetFfprobePath()
+        {
+            try
+            {
+                var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                var local = Path.Combine(baseDir, "ffmpeg", "ffprobe.exe");
+                if (File.Exists(local)) return local;
+                var inRoot = Path.Combine(baseDir, "ffprobe.exe");
+                if (File.Exists(inRoot)) return inRoot;
+            }
+            catch { }
+            return string.Empty;
+        }
+
+        private async Task<double> GetVideoDurationSecondsAsync(string ffprobePath, string videoPath)
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = ffprobePath,
+                    Arguments = $"-v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{videoPath}\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                using var p = System.Diagnostics.Process.Start(psi);
+                if (p != null)
+                {
+                    var output = await p.StandardOutput.ReadToEndAsync();
+                    await p.WaitForExitAsync();
+                    if (double.TryParse(output.Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var seconds))
+                    {
+                        return seconds;
+                    }
+                }
+            }
+            catch { }
+            return 0;
+        }
+
+        private static string GetThumbnailCachePath(string deviceId, RecoverableFile file)
+        {
+            var cacheDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryThumbCache");
+            Directory.CreateDirectory(cacheDir);
+            var key = $"{deviceId}|{file.DevicePath}|{file.SizeInBytes}";
+            using var sha1 = SHA1.Create();
+            var hash = Convert.ToHexString(sha1.ComputeHash(Encoding.UTF8.GetBytes(key))).ToLowerInvariant();
+            return Path.Combine(cacheDir, $"{hash}.jpg");
+        }
+
+        private async Task<bool> ExtractAudioThumbnailAsync(RecoverableFile file, string cachePath)
+        {
+            try
+            {
+                if (_selectedDeviceId == null) return false;
+
+                // Skip very large audio files (> 200MB)
+                if (file.SizeInBytes > 200 * 1024 * 1024) return false;
+
+                var ffmpegPath = GetFfmpegPath();
+                if (string.IsNullOrEmpty(ffmpegPath) || !File.Exists(ffmpegPath)) return false;
+
+                // Prepare temp paths
+                var tempDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryAudioThumbs");
+                Directory.CreateDirectory(tempDir);
+                var ext = string.IsNullOrEmpty(Path.GetExtension(file.DevicePath)) ? "mp3" : Path.GetExtension(file.DevicePath).TrimStart('.').ToLower();
+                var tempAudio = Path.Combine(tempDir, $"temp_{Guid.NewGuid()}.{ext}");
+                var thumbPath = Path.Combine(tempDir, $"thumb_{Guid.NewGuid()}.jpg");
+
+                // Pull small portion (2MB) from device for speed
+                var cmd = $"\"{_adbService.GetAdbPath()}\" -s {_selectedDeviceId} exec-out \"dd if='{file.DevicePath}' bs=1M count=2\" > \"{tempAudio}\"";
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = "/c " + cmd,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                using (var p = System.Diagnostics.Process.Start(psi))
+                {
+                    if (p != null) await p.WaitForExitAsync();
+                }
+
+                if (!File.Exists(tempAudio) || new FileInfo(tempAudio).Length < 8 * 1024)
+                {
+                    // Fallback: full pull if <= 20MB
+                    if (file.SizeInBytes > 20 * 1024 * 1024) return false;
+                    var pull = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = _adbService.GetAdbPath(),
+                        Arguments = $"-s {_selectedDeviceId} pull \"{file.DevicePath}\" \"{tempAudio}\"",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true,
+                        WorkingDirectory = Path.GetDirectoryName(_adbService.GetAdbPath()) ?? ""
+                    };
+                    using var pullProc = System.Diagnostics.Process.Start(pull);
+                    if (pullProc != null) await pullProc.WaitForExitAsync();
+                }
+
+                if (!File.Exists(tempAudio)) return false;
+
+                // Try to extract embedded cover art
+                var coverArgs = $"-y -i \"{tempAudio}\" -an -vcodec mjpeg -map 0:v:0 -frames:v 1 \"{thumbPath}\"";
+                var ff1 = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = ffmpegPath,
+                    Arguments = coverArgs,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                using (var proc1 = System.Diagnostics.Process.Start(ff1))
+                {
+                    if (proc1 != null) await proc1.WaitForExitAsync();
+                }
+
+                if (!File.Exists(thumbPath) || new FileInfo(thumbPath).Length == 0)
+                {
+                    // Generate waveform image if no cover
+                    var waveArgs = $"-y -i \"{tempAudio}\" -filter_complex showwavespic=s=320x120:split_channels=0:colors=DodgerBlue -frames:v 1 \"{thumbPath}\"";
+                    var ff2 = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = ffmpegPath,
+                        Arguments = waveArgs,
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    };
+                    using (var proc2 = System.Diagnostics.Process.Start(ff2))
+                    {
+                        if (proc2 != null) await proc2.WaitForExitAsync();
+                    }
+                }
+
+                // Save to cache
+                if (File.Exists(thumbPath) && new FileInfo(thumbPath).Length > 0)
+                {
+                    try { File.Copy(thumbPath, cachePath, true); } catch { }
+                    Dispatcher.Invoke(() => { file.ThumbnailPath = cachePath; });
+                    return true;
+                }
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private async Task<bool> ExtractDocumentThumbnailAsync(RecoverableFile file, string cachePath)
+        {
+            try
+            {
+                if (_selectedDeviceId == null) return false;
+
+                // Pull the document locally (cap to 20MB)
+                if (file.SizeInBytes > 20 * 1024 * 1024) return false;
+
+                var tempDir = Path.Combine(Path.GetTempPath(), "AndroidRecoveryDocThumbs");
+                Directory.CreateDirectory(tempDir);
+                var ext = Path.GetExtension(file.DevicePath).ToLowerInvariant();
+                var tempDoc = Path.Combine(tempDir, $"temp_{Guid.NewGuid()}{ext}");
+                var tempPng = Path.Combine(tempDir, $"thumb_{Guid.NewGuid()}.png");
+
+                var pull = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = _adbService.GetAdbPath(),
+                    Arguments = $"-s {_selectedDeviceId} pull \"{file.DevicePath}\" \"{tempDoc}\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                    WorkingDirectory = Path.GetDirectoryName(_adbService.GetAdbPath()) ?? ""
+                };
+                using var pullProc = System.Diagnostics.Process.Start(pull);
+                if (pullProc != null) await pullProc.WaitForExitAsync();
+                if (!File.Exists(tempDoc)) return false;
+
+                bool ok = false;
+                // Try MuPDF mutool for PDFs
+                if (ext == ".pdf")
+                {
+                    var mutool = GetMutoolPath();
+                    if (!string.IsNullOrEmpty(mutool) && File.Exists(mutool))
+                    {
+                        var psi = new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = mutool,
+                            Arguments = $"draw -o \"{tempPng}\" -r 96 -w 320 -h 320 \"{tempDoc}\" 1",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true
+                        };
+                        using var p = System.Diagnostics.Process.Start(psi);
+                        if (p != null) await p.WaitForExitAsync();
+                        ok = File.Exists(tempPng) && new FileInfo(tempPng).Length > 0;
+                    }
+                }
+
+                // Try LibreOffice headless for Office docs
+                if (!ok && (ext == ".doc" || ext == ".docx" || ext == ".ppt" || ext == ".pptx" || ext == ".xls" || ext == ".xlsx"))
+                {
+                    var soffice = GetSofficePath();
+                    if (!string.IsNullOrEmpty(soffice) && File.Exists(soffice))
+                    {
+                        var outDir = tempDir;
+                        var psi = new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = soffice,
+                            Arguments = $"--headless --convert-to png --outdir \"{outDir}\" \"{tempDoc}\"",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true
+                        };
+                        using var p = System.Diagnostics.Process.Start(psi);
+                        if (p != null) await p.WaitForExitAsync();
+                        // Pick first generated PNG
+                        var firstPng = Directory.GetFiles(outDir, "*.png").OrderBy(f => f).FirstOrDefault();
+                        if (!string.IsNullOrEmpty(firstPng))
+                        {
+                            tempPng = firstPng;
+                            ok = true;
+                        }
+                    }
+                }
+
+                if (ok && File.Exists(tempPng))
+                {
+                    // Copy to cache as jpg (simple copy, allow png extension if needed)
+                    try { File.Copy(tempPng, cachePath, true); } catch { }
+                    Dispatcher.Invoke(() => { file.ThumbnailPath = cachePath; });
+                    return true;
+                }
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private string GetMutoolPath()
+        {
+            try
+            {
+                var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                var local = Path.Combine(baseDir, "tools", "mutool.exe");
+                if (File.Exists(local)) return local;
+                var inRoot = Path.Combine(baseDir, "mutool.exe");
+                if (File.Exists(inRoot)) return inRoot;
+            }
+            catch { }
+            return string.Empty;
+        }
+
+        private string GetSofficePath()
+        {
+            try
+            {
+                // Common Windows install paths
+                var candidates = new[]
+                {
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "LibreOffice", "program", "soffice.exe"),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "LibreOffice", "program", "soffice.exe")
+                };
+                foreach (var p in candidates)
+                {
+                    if (File.Exists(p)) return p;
+                }
+            }
+            catch { }
+            return string.Empty;
         }
 
         private void OnProgressUpdate(object? sender, string message)
@@ -1086,10 +1784,26 @@ namespace AndroidRecoveryTool
                     // Load video preview if file exists (either from recovery or pull)
                     if (File.Exists(tempFilePath) && new FileInfo(tempFilePath).Length > 0)
                     {
+                        // Detect video rotation from metadata
+                        double rotationAngle = 0;
+                        var ffprobePath = GetFfprobePath();
+                        if (!string.IsNullOrEmpty(ffprobePath) && File.Exists(ffprobePath))
+                        {
+                            rotationAngle = await GetVideoRotationAsync(ffprobePath, tempFilePath);
+                        }
+
+                        var finalRotation = rotationAngle; // Capture for closure
                         Dispatcher.Invoke(() =>
                         {
                             try
                             {
+                                // Apply rotation transform
+                                var rotateTransform = mediaVideoPreview.RenderTransform as RotateTransform;
+                                if (rotateTransform != null)
+                                {
+                                    rotateTransform.Angle = finalRotation;
+                                }
+                                
                                 // Set video source
                                 mediaVideoPreview.Source = new Uri(tempFilePath, UriKind.Absolute);
                                 pnlVideoPreview.Visibility = Visibility.Visible;
@@ -1219,6 +1933,84 @@ namespace AndroidRecoveryTool
             btnStopVideo.IsEnabled = false;
         }
 
+        private async void MediaVideoPreview_MediaOpened(object sender, RoutedEventArgs e)
+        {
+            // Re-check rotation when video opens (in case it wasn't set earlier)
+            try
+            {
+                if (mediaVideoPreview.Source != null && mediaVideoPreview.Source.IsFile)
+                {
+                    var videoPath = mediaVideoPreview.Source.LocalPath;
+                    var ffprobePath = GetFfprobePath();
+                    if (!string.IsNullOrEmpty(ffprobePath) && File.Exists(ffprobePath))
+                    {
+                        var rotation = await GetVideoRotationAsync(ffprobePath, videoPath);
+                        Dispatcher.Invoke(() =>
+                        {
+                            var rotateTransform = mediaVideoPreview.RenderTransform as RotateTransform;
+                            if (rotateTransform != null)
+                            {
+                                rotateTransform.Angle = rotation;
+                            }
+                        });
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private async Task<double> GetVideoRotationAsync(string ffprobePath, string videoPath)
+        {
+            try
+            {
+                // Try to get rotation from stream tags (most common for phone videos)
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = ffprobePath,
+                    Arguments = $"-v error -show_entries stream_tags=rotate -of default=noprint_wrappers=1:nokey=1 \"{videoPath}\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using var p = System.Diagnostics.Process.Start(psi);
+                if (p != null)
+                {
+                    var output = await p.StandardOutput.ReadToEndAsync();
+                    await p.WaitForExitAsync();
+                    
+                    if (double.TryParse(output.Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var rot))
+                    {
+                        return rot;
+                    }
+                }
+
+                // Alternative: check format tags
+                var psi2 = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = ffprobePath,
+                    Arguments = $"-v error -show_entries format_tags=rotate -of default=noprint_wrappers=1:nokey=1 \"{videoPath}\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                using var p2 = System.Diagnostics.Process.Start(psi2);
+                if (p2 != null)
+                {
+                    var output2 = await p2.StandardOutput.ReadToEndAsync();
+                    await p2.WaitForExitAsync();
+                    if (double.TryParse(output2.Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var rot2))
+                    {
+                        return rot2;
+                    }
+                }
+            }
+            catch { }
+            return 0; // No rotation detected - video is already correct orientation
+        }
+
         private void ClearPreview()
         {
             txtNoPreview.Visibility = Visibility.Visible;
@@ -1240,6 +2032,84 @@ namespace AndroidRecoveryTool
             btnPlayVideo.IsEnabled = false;
             btnPauseVideo.IsEnabled = false;
             btnStopVideo.IsEnabled = false;
+        }
+
+        private async void MenuUnlockScreen_Click(object sender, RoutedEventArgs e)
+        {
+            if (_selectedDeviceId == null)
+            {
+                System.Windows.MessageBox.Show("Please select a device first.", "No Device Selected", 
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            try
+            {
+                txtStatus.Text = "Unlocking screen...";
+                
+                // Wake up the device
+                await _adbService.ExecuteShellCommandAsync(_selectedDeviceId, "input keyevent KEYCODE_WAKEUP");
+                await Task.Delay(200);
+                
+                // Dismiss keyguard (unlock screen)
+                await _adbService.ExecuteShellCommandAsync(_selectedDeviceId, "wm dismiss-keyguard");
+                await Task.Delay(200);
+                
+                // Alternative method: swipe up to unlock (if dismiss-keyguard doesn't work)
+                // Get screen dimensions first
+                var dims = await _adbService.ExecuteShellCommandAsync(_selectedDeviceId, "wm size");
+                var screenWidth = 1080; // Default
+                var screenHeight = 1920; // Default
+                
+                if (dims.Contains("Physical size:"))
+                {
+                    var match = System.Text.RegularExpressions.Regex.Match(dims, @"Physical size: (\d+)x(\d+)");
+                    if (match.Success)
+                    {
+                        screenWidth = int.Parse(match.Groups[1].Value);
+                        screenHeight = int.Parse(match.Groups[2].Value);
+                    }
+                }
+                
+                // Swipe up gesture (from bottom center to top center)
+                var swipeY1 = (int)(screenHeight * 0.8);
+                var swipeY2 = (int)(screenHeight * 0.2);
+                var swipeX = screenWidth / 2;
+                
+                await _adbService.ExecuteShellCommandAsync(_selectedDeviceId, 
+                    $"input swipe {swipeX} {swipeY1} {swipeX} {swipeY2} 500");
+                
+                txtStatus.Text = "Screen unlocked (if device has pattern/PIN, you may still need to enter it manually).";
+                
+                System.Windows.MessageBox.Show(
+                    "Unlock command sent to device.\n\n" +
+                    "Note: If your device has a lock pattern, PIN, or password, you may still need to enter it manually on the device screen.",
+                    "Screen Unlock",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                txtStatus.Text = $"Error unlocking screen: {ex.Message}";
+                System.Windows.MessageBox.Show($"Failed to unlock screen: {ex.Message}", "Error", 
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void MenuAbout_Click(object sender, RoutedEventArgs e)
+        {
+            System.Windows.MessageBox.Show(
+                "Android File Recovery Tool\n\n" +
+                "Recover deleted photos, videos, documents, and more from your Android device.\n\n" +
+                "Features:\n" +
+                "• Recover deleted files from Android devices\n" +
+                "• Preview files before recovery\n" +
+                "• Support for images, videos, documents, and audio\n" +
+                "• Deep recovery for permanently deleted files (requires root)\n\n" +
+                "Version: 1.0",
+                "About",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
         }
 
         private async void BtnRecoverSelected_Click(object sender, RoutedEventArgs e)
